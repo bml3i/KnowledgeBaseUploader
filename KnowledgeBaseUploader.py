@@ -2,29 +2,81 @@
 import os
 import re
 import json
+import logging
 import configparser
 from pathlib import Path
 import psycopg2
 import psycopg2.extras
+from datetime import datetime
 
 # -------------------- 常量 --------------------
 META_START = '<<<<.<<<<.<<<<'
 META_END   = '>>>>.>>>>.>>>>'
 SEP_LINE   = '----------'
 
-# -------------------- 读配置 ------------------
-cfg = configparser.ConfigParser()
-cfg.read(Path(__file__).with_name('config.ini'), encoding='utf-8')
+# -------------------- 日志设置 ------------------
+log_dir = Path(__file__).parent / 'logs'
+log_dir.mkdir(exist_ok=True)
 
-ROOT = Path(cfg['common']['root_path']).expanduser()
-EXT  = cfg['common']['file_extension'].strip()
-EXT  = None if EXT == '*' else {e.strip().lower() for e in EXT.split(',')}
+log_file = log_dir / f'kb_uploader_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
 
-DB = cfg['postgres']
-conn = psycopg2.connect(
-    host=DB['server'], port=DB['port'], dbname=DB['db'],
-    user=DB['user'], password=DB['password']
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()
+    ]
 )
+
+# -------------------- 读配置 ------------------
+try:
+    cfg = configparser.ConfigParser()
+    config_path = Path(__file__).with_name('.config.ini')
+    sample_path = Path(__file__).with_name('.config.ini.sample')
+    
+    if not config_path.exists():
+        if sample_path.exists():
+            logging.error(f"配置文件不存在: {config_path}")
+            logging.error(f"请从示例配置创建配置文件，执行命令: cp {sample_path} {config_path}")
+            print(f"\n配置文件不存在: {config_path}")
+            print(f"请从示例配置创建配置文件，执行命令: cp {sample_path} {config_path}\n")
+        else:
+            logging.error(f"配置文件不存在: {config_path}，示例配置文件也不存在: {sample_path}")
+            print(f"\n配置文件不存在: {config_path}，示例配置文件也不存在: {sample_path}\n")
+        exit(1)
+        
+    cfg.read(config_path, encoding='utf-8')
+    
+    ROOT = Path(cfg['common']['root_path']).expanduser()
+    if not ROOT.exists():
+        logging.warning(f"指定的根目录不存在: {ROOT}，将尝试创建")
+        ROOT.mkdir(parents=True, exist_ok=True)
+        
+    EXT = cfg['common']['file_extension'].strip()
+    EXT = None if EXT == '*' else {e.strip().lower() for e in EXT.split(',')}
+    
+    logging.info(f"扫描目录: {ROOT}")
+    logging.info(f"文件扩展名过滤: {EXT if EXT else '所有文件'}")
+    
+    # 数据库连接
+    DB = cfg['postgres']
+    try:
+        conn = psycopg2.connect(
+            host=DB['server'], port=DB['port'], dbname=DB['db'],
+            user=DB['user'], password=DB['password']
+        )
+        logging.info("数据库连接成功")
+    except psycopg2.Error as e:
+        logging.error(f"数据库连接失败: {e}")
+        exit(1)
+        
+except KeyError as e:
+    logging.error(f"配置文件缺少必要的配置项: {e}")
+    exit(1)
+except Exception as e:
+    logging.error(f"读取配置文件时出错: {e}")
+    exit(1)
 
 # -------------------- 工具函数 ----------------
 def upsert_tags(cur, tags):
@@ -83,41 +135,101 @@ def upsert_record(cur, meta, content):
     )
 
 # -------------------- 主循环 ------------------
-meta_re = re.compile(re.escape(META_START) + r'(.*?)' + re.escape(META_END), re.DOTALL)
+def validate_metadata(meta, path):
+    """验证元数据是否包含所有必要字段"""
+    required_fields = ['echoToken', 'summary', 'tags', 'resources']
+    for field in required_fields:
+        if field not in meta:
+            logging.error(f"元数据缺少必要字段 '{field}' 在文件 {path}")
+            return False
+            
+    # 验证字段类型
+    if not isinstance(meta['tags'], list):
+        logging.error(f"元数据中 'tags' 必须是数组类型 在文件 {path}")
+        return False
+        
+    if not isinstance(meta['resources'], list):
+        logging.error(f"元数据中 'resources' 必须是数组类型 在文件 {path}")
+        return False
+        
+    return True
 
-files = ROOT.rglob('*') if EXT is None else \
-        (p for p in ROOT.rglob('*') if p.suffix.lower().lstrip('.') in EXT)
+try:
+    meta_re = re.compile(re.escape(META_START) + r'(.*?)' + re.escape(META_END), re.DOTALL)
 
-for path in files:
-    if not path.is_file():
-        continue
-    try:
-        text = path.read_text(encoding='utf-8', errors='ignore')
-    except Exception as e:
-        print('Read error:', path, e)
-        continue
+    files = ROOT.rglob('*') if EXT is None else \
+            (p for p in ROOT.rglob('*') if p.suffix.lower().lstrip('.') in EXT)
 
-    for m in meta_re.finditer(text):
-        meta_json = m.group(1).strip()
+    total_files = 0
+    processed_files = 0
+    records_found = 0
+    records_updated = 0
+    records_failed = 0
+
+    logging.info("开始扫描文件...")
+
+    for path in files:
+        if not path.is_file():
+            continue
+            
+        total_files += 1
+        
+        # 跳过日志文件夹中的文件
+        if log_dir in path.parents:
+            continue
+            
         try:
-            meta = json.loads(meta_json)
-        except Exception as e:          # 捕获所有解析异常
-            print('Invalid JSON in', path, e)
-            print('Problematic JSON >>>', meta_json, '<<<')
-            continue                    # 必须跳过，不能往下走
-
-        # 下面这一行只是防御式二次检查，可留可不留
-        if not isinstance(meta, dict):
-            print('Meta is not dict in', path)
+            text = path.read_text(encoding='utf-8', errors='ignore')
+            processed_files += 1
+        except Exception as e:
+            logging.error(f"读取文件失败: {path}, 错误: {e}")
             continue
 
-        start = m.end()
-        end_sep = text.find(SEP_LINE, start)
-        content = text[start:end_sep if end_sep != -1 else None].strip()
+        for m in meta_re.finditer(text):
+            records_found += 1
+            meta_json = m.group(1).strip()
+            try:
+                meta = json.loads(meta_json)
+            except Exception as e:          # 捕获所有解析异常
+                logging.error(f"JSON解析失败 在文件 {path}, 错误: {e}")
+                logging.debug(f"有问题的JSON >>> {meta_json} <<<")
+                records_failed += 1
+                continue                    # 必须跳过，不能往下走
 
-        with conn.cursor() as cur:
-            upsert_record(cur, meta, content)
-        conn.commit()
+            # 验证元数据
+            if not isinstance(meta, dict):
+                logging.error(f"元数据不是字典类型 在文件 {path}")
+                records_failed += 1
+                continue
+                
+            if not validate_metadata(meta, path):
+                records_failed += 1
+                continue
 
-conn.close()
-print('KnowledgeBaseUploader finished.')
+            start = m.end()
+            end_sep = text.find(SEP_LINE, start)
+            content = text[start:end_sep if end_sep != -1 else None].strip()
+
+            try:
+                with conn.cursor() as cur:
+                    upsert_record(cur, meta, content)
+                conn.commit()
+                records_updated += 1
+                logging.info(f"成功更新记录: {meta['echoToken']} 从文件 {path}")
+            except psycopg2.Error as e:
+                conn.rollback()
+                logging.error(f"数据库操作失败: {e}, 在文件 {path}, echoToken: {meta.get('echoToken', '未知')}")
+                records_failed += 1
+
+    logging.info(f"扫描完成: 总文件数 {total_files}, 处理文件数 {processed_files}")
+    logging.info(f"知识库记录: 发现 {records_found}, 更新 {records_updated}, 失败 {records_failed}")
+
+except Exception as e:
+    logging.error(f"程序执行过程中发生错误: {e}")
+finally:
+    if 'conn' in locals() and conn:
+        conn.close()
+        logging.info("数据库连接已关闭")
+    
+    logging.info("KnowledgeBaseUploader 执行完毕")
+    print(f"KnowledgeBaseUploader 执行完毕，详细日志请查看: {log_file}")

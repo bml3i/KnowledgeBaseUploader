@@ -1,0 +1,10 @@
+[common]
+root_path = ~/worknotes
+file_extension = txt,md
+
+[postgres]
+server = localhost
+port   = 5432
+db     = postgres
+user   = your_username
+password = your_password
