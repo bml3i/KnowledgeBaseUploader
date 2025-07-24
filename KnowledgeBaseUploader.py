@@ -7,7 +7,7 @@ import configparser
 from pathlib import Path
 import psycopg2
 import psycopg2.extras
-from datetime import datetime
+from datetime import datetime, date
 
 # -------------------- 常量 --------------------
 META_START = '<<<<.<<<<.<<<<'
@@ -79,6 +79,21 @@ except Exception as e:
     exit(1)
 
 # -------------------- 工具函数 ----------------
+def extract_date_from_resources(resources):
+    """从resources数组中提取yyyy-MM-dd格式的日期"""
+    date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+    
+    for resource in resources:
+        if isinstance(resource, str) and date_pattern.match(resource):
+            try:
+                # 验证是否为合法日期
+                parsed_date = datetime.strptime(resource, '%Y-%m-%d').date()
+                return parsed_date
+            except ValueError:
+                # 格式匹配但不是合法日期，继续检查下一个
+                continue
+    return None
+
 def upsert_tags(cur, tags):
     """返回 tag_id 列表"""
     tag_ids = []
@@ -106,22 +121,58 @@ def upsert_record(cur, meta, content):
     if is_active is None:
         is_active = True            # 新增时默认 True
 
-    # 新增时插入；冲突时只有 is_active 有提供才更新，否则保持原值
-    cur.execute("""
-        INSERT INTO kb_records(echo_token, summary, content, resources, tags_cache, is_active)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (echo_token) DO UPDATE
-        SET summary    = EXCLUDED.summary,
-            content    = EXCLUDED.content,
-            resources  = EXCLUDED.resources,
-            tags_cache = EXCLUDED.tags_cache,
-            is_active  = CASE
-                   WHEN EXCLUDED.is_active IS NULL   -- JSON 里没给值
-                   THEN kb_records.is_active         -- 保持原值
-                   ELSE EXCLUDED.is_active           -- 用 JSON 提供的 true/false
-                 END
-        RETURNING id
-    """, (echo_token, summary, content, resources, tags, is_active))
+    # 2. 检查是否存在记录（判断是否为更新操作）
+    cur.execute("SELECT id, created_at FROM kb_records WHERE echo_token = %s", (echo_token,))
+    existing_record = cur.fetchone()
+    is_update = existing_record is not None
+    
+    # 3. 检查resources中是否包含日期格式
+    target_date = extract_date_from_resources(resources)
+    
+    # 4. 构建SQL语句
+    if is_update and target_date:
+        # 更新操作且找到日期：需要更新created_at的日期部分
+        existing_id, existing_created_at = existing_record
+        # 保持原有的时间部分，只替换日期部分
+        new_created_at = datetime.combine(target_date, existing_created_at.time())
+        if existing_created_at.tzinfo:
+            new_created_at = new_created_at.replace(tzinfo=existing_created_at.tzinfo)
+        
+        cur.execute("""
+             INSERT INTO kb_records(echo_token, summary, content, resources, tags_cache, is_active, created_at)
+             VALUES (%s, %s, %s, %s, %s, %s, %s)
+             ON CONFLICT (echo_token) DO UPDATE
+             SET summary    = EXCLUDED.summary,
+                 content    = EXCLUDED.content,
+                 resources  = EXCLUDED.resources,
+                 tags_cache = EXCLUDED.tags_cache,
+                 created_at = EXCLUDED.created_at,
+                 is_active  = CASE
+                        WHEN EXCLUDED.is_active IS NULL   -- JSON 里没给值
+                        THEN kb_records.is_active         -- 保持原值
+                        ELSE EXCLUDED.is_active           -- 用 JSON 提供的 true/false
+                      END
+             RETURNING id
+         """, (echo_token, summary, content, resources, tags, is_active, new_created_at))
+        
+        logging.info(f"更新记录 {echo_token} 的created_at日期部分为: {target_date}")
+    else:
+        # 新增操作或更新操作但没有日期：使用原有逻辑
+        cur.execute("""
+            INSERT INTO kb_records(echo_token, summary, content, resources, tags_cache, is_active)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (echo_token) DO UPDATE
+            SET summary    = EXCLUDED.summary,
+                content    = EXCLUDED.content,
+                resources  = EXCLUDED.resources,
+                tags_cache = EXCLUDED.tags_cache,
+                is_active  = CASE
+                       WHEN EXCLUDED.is_active IS NULL   -- JSON 里没给值
+                       THEN kb_records.is_active         -- 保持原值
+                       ELSE EXCLUDED.is_active           -- 用 JSON 提供的 true/false
+                     END
+            RETURNING id
+        """, (echo_token, summary, content, resources, tags, is_active))
     
     rid = cur.fetchone()[0]
 
