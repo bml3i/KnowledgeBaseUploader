@@ -8,3 +8,4 @@ port   = 5432
 db     = postgres
 user   = your_username
 password = your_password
+sslmode = require

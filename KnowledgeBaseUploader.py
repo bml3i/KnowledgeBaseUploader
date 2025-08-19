@@ -64,7 +64,8 @@ try:
     try:
         conn = psycopg2.connect(
             host=DB['server'], port=DB['port'], dbname=DB['db'],
-            user=DB['user'], password=DB['password']
+            user=DB['user'], password=DB['password'],
+            sslmode=DB.get('sslmode', 'prefer')
         )
         logging.info("数据库连接成功")
     except psycopg2.Error as e:
